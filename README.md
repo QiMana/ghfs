@@ -5,57 +5,66 @@ The GitHub Filesystem (GHFS) is a user space filesystem that overlays the
 GitHub API. It allows you to access repositories and files using standard
 Unix commands such as `ls` and `cat`.
 
+This fork (`QiMana/ghfs`) includes modern build metadata, nested traversal fixes,
+and operational commands for reliable agent workflows.
 
 ## Install
 
-To use ghfs, you'll need to install [Go][go]. If you're running OS X then you'll
-also need to install [MacFUSE][macfuse]. Then you can install ghfs by running:
+Build from source:
 
 ```sh
-$ go get github.com/benbjohnson/ghfs/...
+go build -o ghfs ./cmd/ghfs
 ```
 
-This will install `ghfs` into your `$GOBIN` directory. Next you'll need to
-create a directory and use `ghfs` to mount GitHub:
+## Commands
+
+### Doctor
+
+Validate local prerequisites and auth posture:
 
 ```sh
-$ mkdir ~/github
-$ ghfs ~/github &
+ghfs doctor
 ```
 
-Now you can read data from the GitHub API via the `~/github` directory.
+`doctor` exits non-zero only for hard blockers (e.g. missing FUSE).
 
-[go]: https://golang.org
-[macfuse]: https://osxfuse.github.io
-
-
-## Usage
-
-GHFS uses GitHub URL conventions for pathing. For example, to go to a user
-you can `cd` using their username:
+### Mount
 
 ```sh
-$ cd ~/github/boltdb
+ghfs mount [--token <token>] [--token-file <path>] [--token-source env|none] <mountpoint>
 ```
 
-To go to a repository, you can use the username and repository name:
+For backward compatibility, legacy mode is still supported:
 
 ```sh
-$ cd ~/github/boltdb/bolt
+ghfs -token <token> <mountpoint>
+# or
+ghfs <mountpoint>
 ```
 
-Once you're in a repository, you can list files using `ls` and you can print
-out file contents using the `cat` tool.
+### Status
 
 ```sh
-bolt $ cat LICENSE
-The MIT License (MIT)
-
-Copyright (c) 2013 Ben Johnson
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal in
-...
+ghfs status <mountpoint>
 ```
 
+Reports mount health, PID/state metadata, and exits non-zero when not mounted.
 
+### Unmount
+
+```sh
+ghfs unmount <mountpoint>
+```
+
+Idempotent: if already unmounted, it reports that state and exits success.
+
+## Path model
+
+GHFS uses GitHub URL conventions for pathing:
+
+```sh
+/mount/<owner>
+/mount/<owner>/<repo>
+```
+
+Once in a repository path, use normal Unix tools (`ls`, `cat`, etc.).
