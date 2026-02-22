@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/base64"
+	"context"
 	"flag"
 	"io"
 	"log"
@@ -11,53 +11,60 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"code.google.com/p/goauth2/oauth"
-	"github.com/google/go-github/github"
-	"golang.org/x/net/context"
+	github "github.com/google/go-github/v62/github"
 )
 
 func main() {
 	log.SetFlags(0)
 
-	// Parse arguments and require that we have the path.
 	token := flag.String("token", "", "personal access token")
 	flag.Parse()
 	if flag.NArg() != 1 {
 		log.Fatal("path required")
 	}
-	log.Printf("mounting to: %s", flag.Arg(0))
+	mountPath := flag.Arg(0)
+	log.Printf("mounting to: %s", mountPath)
 
-	// Create FUSE connection.
-	conn, err := fuse.Mount(flag.Arg(0))
+	conn, err := fuse.Mount(mountPath)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer conn.Close()
 
-	// Create OAuth transport.
-	var c *http.Client
-	if *token != "" {
-		c = (&oauth.Transport{Token: &oauth.Token{AccessToken: *token}}).Client()
-	}
-
-	// Create filesystem.
-	filesys := &FS{Client: github.NewClient(c)}
+	client := newGitHubClient(*token)
+	filesys := &FS{Client: client}
 	if err := fs.Serve(conn, filesys); err != nil {
-		log.Fatal(err)
-	}
-
-	// Wait until the mount is unmounted or there is an error.
-	<-conn.Ready
-	if err := conn.MountError; err != nil {
 		log.Fatal(err)
 	}
 }
 
-// FS represents the
+func newGitHubClient(token string) *github.Client {
+	if token == "" {
+		return github.NewClient(nil)
+	}
+	httpClient := &http.Client{Transport: &tokenTransport{Token: token, Base: http.DefaultTransport}}
+	return github.NewClient(httpClient)
+}
+
+type tokenTransport struct {
+	Token string
+	Base  http.RoundTripper
+}
+
+func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.Base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "token "+t.Token)
+	return base.RoundTrip(clone)
+}
+
 type FS struct {
 	Client *github.Client
 }
 
-// Root returns the root filesystem node.
 func (f *FS) Root() (fs.Node, error) {
 	return &Root{FS: f}, nil
 }
@@ -66,16 +73,14 @@ type Root struct {
 	FS *FS
 }
 
-func (r *Root) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (r *Root) Attr(_ context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0o755
+	return nil
 }
 
-func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
+func (r *Root) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
-	u, _, err := r.FS.Client.Users.Get(req.Name)
+	u, _, err := r.FS.Client.Users.Get(ctx, name)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -87,20 +92,18 @@ type User struct {
 	FS *FS
 }
 
-func (u *User) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (u *User) Attr(_ context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0o755
+	return nil
 }
 
-func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
+func (u *User) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
-	r, _, err := u.FS.Client.Repositories.Get(*u.Login, req.Name)
+	repo, _, err := u.FS.Client.Repositories.Get(ctx, u.GetLogin(), name)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
-	return &Repository{FS: u.FS, Repository: r}, nil
+	return &Repository{FS: u.FS, Repository: repo}, nil
 }
 
 type Repository struct {
@@ -108,79 +111,136 @@ type Repository struct {
 	FS *FS
 }
 
-var _ = fs.HandleReadDirAller(&Repository{})
+var _ fs.HandleReadDirAller = (*Repository)(nil)
 
-func (r *Repository) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (r *Repository) Attr(_ context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0o755
+	return nil
 }
 
-func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
-
-	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(*r.Owner.Login, *r.Name, req.Name, nil)
-	if err != nil {
-		return nil, fuse.ENOENT
-	}
-	if fileContent != nil {
-		return &File{FS: r.FS, Content: fileContent}, nil
-	}
-	return &Dir{FS: r.FS, Contents: directoryContent}, nil
+func (r *Repository) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	owner, repo := r.GetOwner().GetLogin(), r.GetName()
+	return lookupPath(ctx, r.FS, owner, repo, name)
 }
 
 func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	_, directoryContent, _, err := r.FS.Client.Repositories.GetContents(*r.Owner.Login, *r.Name, "", nil)
-	if err != nil {
-		return nil, fuse.ENOENT
-	}
-
-	var entries []fuse.Dirent
-	for _, f := range directoryContent {
-		entries = append(entries, fuse.Dirent{Name: *f.Name})
-	}
-	return entries, nil
+	owner, repo := r.GetOwner().GetLogin(), r.GetName()
+	return listDirectory(ctx, r.FS, owner, repo, "")
 }
 
 type File struct {
-	Content *github.RepositoryContent
 	FS      *FS
+	Content *github.RepositoryContent
 }
 
-func (f *File) Attr() fuse.Attr {
-	return fuse.Attr{
-		Size: uint64(*f.Content.Size),
-		Mode: 0755,
+func (f *File) Attr(_ context.Context, attr *fuse.Attr) error {
+	mode := os.FileMode(0o444)
+	if f.Content.GetType() == "symlink" {
+		mode = os.FileMode(0o777)
 	}
+	attr.Mode = mode
+	attr.Size = uint64(f.Content.GetSize())
+	return nil
 }
 
-var _ = fs.NodeOpener(&File{})
+var _ fs.NodeOpener = (*File)(nil)
 
-func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (f *File) Open(_ context.Context, _ *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	resp.Flags |= fuse.OpenNonSeekable
-	return &FileHandle{r: base64.NewDecoder(base64.StdEncoding, strings.NewReader(*f.Content.Content))}, nil
+
+	decoded, err := f.Content.GetContent()
+	if err == nil && decoded != "" {
+		return &FileHandle{r: strings.NewReader(decoded)}, nil
+	}
+
+	downloadURL := f.Content.GetDownloadURL()
+	if downloadURL == "" {
+		return nil, fuse.ENOENT
+	}
+	httpResp, httpErr := f.FS.Client.Client().Get(downloadURL)
+	if httpErr != nil {
+		return nil, fuse.EIO
+	}
+	return &FileHandle{r: httpResp.Body}, nil
 }
 
 type FileHandle struct {
 	r io.Reader
 }
 
-var _ = fs.HandleReader(&FileHandle{})
+var _ fs.HandleReader = (*FileHandle)(nil)
 
-func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+func (fh *FileHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	buf := make([]byte, req.Size)
 	n, err := fh.r.Read(buf)
 	resp.Data = buf[:n]
+	if err == io.EOF {
+		return nil
+	}
 	return err
 }
 
 type Dir struct {
-	Contents []*github.RepositoryContent
-	FS       *FS
+	FS    *FS
+	Owner string
+	Repo  string
+	Path  string
 }
 
-func (d *Dir) Attr() fuse.Attr {
-	return fuse.Attr{
-		Mode: os.ModeDir | 0755,
-	}
+var _ fs.HandleReadDirAller = (*Dir)(nil)
+
+func (d *Dir) Attr(_ context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0o755
+	return nil
 }
+
+func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	path := name
+	if d.Path != "" {
+		path = d.Path + "/" + name
+	}
+	return lookupPath(ctx, d.FS, d.Owner, d.Repo, path)
+}
+
+func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	return listDirectory(ctx, d.FS, d.Owner, d.Repo, d.Path)
+}
+
+func lookupPath(ctx context.Context, fsState *FS, owner, repo, path string) (fs.Node, error) {
+	fileContent, directoryContent, _, err := fsState.Client.Repositories.GetContents(ctx, owner, repo, path, nil)
+	if err != nil {
+		return nil, fuse.ENOENT
+	}
+	if fileContent != nil {
+		return &File{FS: fsState, Content: fileContent}, nil
+	}
+	if directoryContent != nil {
+		return &Dir{FS: fsState, Owner: owner, Repo: repo, Path: path}, nil
+	}
+	return nil, fuse.ENOENT
+}
+
+func listDirectory(ctx context.Context, fsState *FS, owner, repo, path string) ([]fuse.Dirent, error) {
+	_, directoryContent, _, err := fsState.Client.Repositories.GetContents(ctx, owner, repo, path, nil)
+	if err != nil {
+		return nil, fuse.ENOENT
+	}
+
+	entries := make([]fuse.Dirent, 0, len(directoryContent))
+	for _, entry := range directoryContent {
+		name := entry.GetName()
+		if name == "" {
+			continue
+		}
+		direntType := fuse.DT_Unknown
+		switch entry.GetType() {
+		case "dir":
+			direntType = fuse.DT_Dir
+		case "file", "symlink", "submodule":
+			direntType = fuse.DT_File
+		}
+		entries = append(entries, fuse.Dirent{Name: name, Type: direntType})
+	}
+	return entries, nil
+}
+
